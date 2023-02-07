@@ -1,186 +1,73 @@
 import test from 'brittle'
 import RAM from 'random-access-memory'
+import Corestore from 'corestore'
+import Hyperswarm from 'hyperswarm'
+import createTestnet from '@hyperswarm/testnet'
+import { tmpdir } from 'os'
 
-import Seeder from '../src/seeder.js'
+import Seeder from '../lib/seeder.js'
 
-test("It saves the right data to the keystore", async (t) => {
-    // Setup
-    const seeder = new Seeder({storage: RAM})
+test('initialization - zero config', async (t) => {
+  const primaryKey = Buffer.alloc(32)
 
-    let expected = {};
+  const seeder = new Seeder()
+  // Override corestore to test consistent primaryKey
+  seeder.corestore = new Corestore(RAM, { primaryKey })
+  await seeder.ready()
 
-    seeder.db = { 
-        put: (key, value) => {
-            t.is(key, 'theKey')
-            t.is(value, JSON.stringify(expected))
-        } 
-    }
+  t.is(seeder.corestore.primaryKey.toString('hex'), '0000000000000000000000000000000000000000000000000000000000000000')
+  t.is(seeder.db.feed.key.toString('hex'), 'c05f9b226b9c5b812d4c8715d2140bd4efda170b5b97b4944ea98d3b45f579ad')
+  t.is(seeder.swarm.keyPair.publicKey.toString('hex'), '3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29')
 
-    // Call it
-    expected = {
-        type: 'hypercore',
-        length: 42,
-        lastUpdated: Date.now()
-    };
-    await seeder._putValue('theKey', 42);
-
-    await seeder.close()
+  await seeder.close()
 })
 
-test("It returns null when no key is found", async (t) => {
-    // Setup
-    const seeder = new Seeder({storage: RAM})
-    seeder.db = { get: async () => null }
+test('can replicate over a seeders topic', async (t) => {
+  const testnet = await createTestnet(3, t.teardown)
 
-    // Call it
-    const result = await seeder._getValue('theKey', 42)
-    t.is(result, null);
+  const storage = tmpdir() + '/' + Math.random().toString(16).slice(2)
 
-    await seeder.close()
-});
+  let seeder = new Seeder({ bootstrap: testnet.bootstrap, storage })
+  await seeder.ready()
 
-test("It returns the decoded value when the key is found", async (t) => {
-    // Setup
-    const expected = { test: 42, value: "thing" }
-    const seeder = new Seeder({storage: RAM})
-    seeder.db = {
-        get: async () => ({ key: 'test', value: JSON.stringify(expected) })
-    }
+  // Mock hypercore
+  const core = seeder.corestore.get({ name: 'foo' })
+  await core.append(['foo', 'bar'])
+  await core.close()
 
-    // Call it
-    const result = await seeder._getValue('theKey', 42)
-    t.alike(result, expected);
+  // Close everything and reopen to prove peristence
+  await seeder.close()
+  seeder = new Seeder({ bootstrap: testnet.bootstrap, storage })
+  await seeder.ready()
 
-    await seeder.close()
-});
+  // Open 10 unrequested hypercores that shouldn't be replicated
+  for (let i = 0; i <= 10; i++) {
+    const core = seeder.corestore.get({ name: 'foo' + i })
+    await core.append(['foo'])
+  }
 
-// _emptyAndOld is no longer in the seeder
-test.skip("It sees empty keys as empty and old", async (t) => {
-    // Setup
-    const seeder = new Seeder({storage: RAM})
-    seeder.db = { get: async () => null }
+  // Client side
+  const swarm = new Hyperswarm(testnet)
 
-    // try all the cases that will count as empty and old
-    // not empty..
-    t.is(await seeder._emptyAndOld('theKey', 5), false)
+  const discoveryKeys = new Set()
+  const corestore = new Corestore(RAM, { _ondiscoverykey: discoveryKeys.add.bind(discoveryKeys) })
 
-    // empty, but has no entry in the db..
-    t.is(await seeder._emptyAndOld('theKey', 0), false)
+  swarm.on('connection', (conn) => {
+    corestore.replicate(conn)
+  })
 
-    // now start returning something from the db
-    seeder.db = {
-        get: async () => ({ key: 'test', value: JSON.stringify({ lastUpdated: Date.now() }) })
-    }
+  swarm.join(seeder.topic, { server: false, client: true })
+  const done = corestore.findingPeers()
+  swarm.flush().then(done, done)
 
-    // empty, has an entry, last updated now
-    t.is(await seeder._emptyAndOld('theKey', 0), false)
+  const readable = corestore.get({ key: core.key })
+  await readable.update()
 
-    // now start returning something from the db that isn't quite old
-    seeder.db = {
-        get: async () => ({ key: 'test', value: JSON.stringify({ lastUpdated: Date.now() - seeder.emptyLifespan + 1 }) })
-    }
+  t.is(readable.length, 2)
+  t.is(readable.length, core.length)
 
-    // empty, has an entry, last updated recently
-    t.is(await seeder._emptyAndOld('theKey', 0), false)
+  t.is(discoveryKeys.size, 0, "shouldn't recieve any unrequested replication")
 
-    // return something that counts as old
-    seeder.db = {
-        get: async () => ({ key: 'test', value: JSON.stringify({ lastUpdated: Date.now() - seeder.emptyLifespan }) })
-    }
-
-    // empty, has an entry, last updated a while ago
-    t.is(await seeder._emptyAndOld('theKey', 0), true)
-
-    await seeder.close()
-});
-
-
-// _emptyAndOld is no longer in the seeder
-test.skip("It sees empty keys as empty and old", async (t) => {
-    // Setup
-    const seeder = new Seeder({storage: RAM})
-    seeder.db = { get: async () => null }
-
-    // try all the cases that will count as empty and old
-    // not empty..
-    t.is(await seeder._emptyAndOld('theKey', 5), false)
-
-    // empty, but has no entry in the db..
-    t.is(await seeder._emptyAndOld('theKey', 0), false)
-
-    // now start returning something from the db
-    seeder.db = {
-        get: async () => ({ key: 'test', value: JSON.stringify({ lastUpdated: Date.now() }) })
-    }
-
-    // empty, has an entry, last updated now
-    t.is(await seeder._emptyAndOld('theKey', 0), false)
-
-    // now start returning something from the db that isn't quite old
-    seeder.db = {
-        get: async () => ({ key: 'test', value: JSON.stringify({ lastUpdated: Date.now() - seeder.emptyLifespan + 1 }) })
-    }
-
-    // empty, has an entry, last updated recently
-    t.is(await seeder._emptyAndOld('theKey', 0), false)
-
-    // return something that counts as old
-    seeder.db = {
-        get: async () => ({ key: 'test', value: JSON.stringify({ lastUpdated: Date.now() - seeder.emptyLifespan }) })
-    }
-
-    // empty, has an entry, last updated a while ago
-    t.is(await seeder._emptyAndOld('theKey', 0), true)
-
-    await seeder.close()
-});
-
-
-// _hasBeenAbandoned is no longer in the seeder
-test.skip("It can detected Abandoned items", async (t) => {
-    // Setup
-    const seeder = new Seeder({storage: RAM})
-    seeder.db = { get: async () => null }
-
-    // item does not exist
-    t.is(await seeder._hasBeenAbandoned('theKey'), false)
-
-
-    // return an item that exists, but is still recent
-    seeder.db = {
-        get: async () => ({ key: 'theKey', value: JSON.stringify({ lastUpdated: Date.now() }) })
-    }
-
-    //  last updated recently
-    t.is(await seeder._hasBeenAbandoned('theKey'), false)
-
-    // return an item that exists, but is still recent
-    seeder.db = {
-        get: async () => ({ key: 'theKey', value: JSON.stringify({ lastUpdated: Date.now() - seeder.fullLifespan }) })
-    }
-
-    //  last updated recently
-    t.is(await seeder._hasBeenAbandoned('theKey'), true)
-
-    await seeder.close()
-});
-
-// _alreadyExists is no loger in the seeder
-test.skip("It can decide if a key already exists", async (t) => {
-    // Setup
-    const seeder = new Seeder({storage: RAM})
-    seeder.db = { get: async () => null }
-
-    // item does not exist
-    t.is(await seeder._alreadyExists('theKey'), false)
-
-    // return an item that exists, but is still recent
-    seeder.db = {
-        get: async () => ({ key: 'theKey', value: JSON.stringify({ lastUpdated: Date.now() }) })
-    }
-
-    //  last updated recently
-    t.is(await seeder._alreadyExists('theKey'), true)
-
-    await seeder.close()
-});
+  await seeder.close()
+  await swarm.destroy()
+})
